@@ -1,0 +1,386 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage:
+  steam-game-icon-sync [--dry-run] [--radius N]
+
+Scans installed Steam appmanifests that have cached Steam artwork, creates one
+256x256 rounded icon per application, writes matching .desktop entries, updates
+the desktop database, and asks Noctalia to refresh its dock.
+
+Games normally use StartupWMClass=steam_app_<AppID>. Native ports whose window
+class differs are detected automatically from running niri windows. Manual
+overrides remain available for unusual titles or multi-window applications.
+
+Environment:
+  STEAM_ROOT                 Steam data directory
+                             (default: ~/.local/share/Steam)
+  STEAM_ICON_CORNER_RADIUS   Source-image corner radius (default: 56)
+  STEAM_GAME_ICON_WMCLASS_OVERRIDES
+                             Optional manual TSV mapping AppID to window class
+                             (default: ~/.config/steam-game-icon-sync/wmclass-overrides.tsv)
+EOF
+}
+
+dry_run=false
+radius="${STEAM_ICON_CORNER_RADIUS:-56}"
+
+while (( $# > 0 )); do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --dry-run)
+            dry_run=true
+            shift
+            ;;
+        --radius)
+            [[ $# -ge 2 ]] || {
+                usage >&2
+                exit 2
+            }
+            radius="$2"
+            shift 2
+            ;;
+        *)
+            printf 'error: unknown argument: %s\n' "$1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
+[[ "$radius" =~ ^[0-9]+$ ]] || {
+    printf 'error: radius must be a non-negative integer\n' >&2
+    exit 2
+}
+
+steam_root="${STEAM_ROOT:-$HOME/.local/share/Steam}"
+app_cache="$steam_root/appcache/librarycache"
+applications_dir="$HOME/.local/share/applications"
+icons_dir="$HOME/.local/share/icons/hicolor/256x256/apps"
+sources_dir="$HOME/.local/share/steam-game-icons/sources"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+rounding_tool="$script_dir/steam-game-icon-round"
+if [[ ! -e "$rounding_tool" ]]; then
+    rounding_tool="$(command -v steam-game-icon-round 2>/dev/null || true)"
+fi
+[[ -n "$rounding_tool" ]] || rounding_tool="$HOME/.local/bin/steam-game-icon-round"
+manual_overrides_file="${STEAM_GAME_ICON_WMCLASS_OVERRIDES:-$HOME/.config/steam-game-icon-sync/wmclass-overrides.tsv}"
+auto_overrides_file="$HOME/.local/share/steam-game-icons/wmclass-auto.tsv"
+
+for required in "$steam_root/steamapps" "$app_cache" "$rounding_tool"; do
+    [[ -e "$required" ]] || {
+        printf 'error: required path missing: %s\n' "$required" >&2
+        exit 1
+    }
+done
+
+command -v magick >/dev/null 2>&1 || {
+    printf 'error: ImageMagick (magick) is required\n' >&2
+    exit 1
+}
+
+mkdir -p "$applications_dir" "$icons_dir" "$sources_dir"
+
+library_roots=("$steam_root")
+library_file="$steam_root/steamapps/libraryfolders.vdf"
+if [[ -r "$library_file" ]]; then
+    while IFS= read -r library_path; do
+        library_roots+=("$library_path")
+    done < <(sed -n 's/^[[:space:]]*"path"[[:space:]]*"\([^"]*\)".*/\1/p' "$library_file")
+fi
+
+declare -A seen_apps=()
+declare -A manual_wmclass_overrides=()
+declare -A auto_wmclass_overrides=()
+
+if [[ -r "$manual_overrides_file" ]]; then
+    while IFS=$'\t' read -r override_app_id override_wm_class _; do
+        [[ -n "$override_app_id" && -n "$override_wm_class" ]] || continue
+        [[ "$override_app_id" != \#* ]] || continue
+        manual_wmclass_overrides["$override_app_id"]="$override_wm_class"
+    done < <(sed 's/\r$//' "$manual_overrides_file")
+fi
+
+if [[ -r "$auto_overrides_file" ]]; then
+    while IFS=$'\t' read -r override_app_id override_wm_class _; do
+        [[ -n "$override_app_id" && -n "$override_wm_class" ]] || continue
+        [[ "$override_app_id" != \#* ]] || continue
+        auto_wmclass_overrides["$override_app_id"]="$override_wm_class"
+    done < <(sed 's/\r$//' "$auto_overrides_file")
+fi
+
+steam_bin="$HOME/.local/bin/steam"
+[[ -x "$steam_bin" ]] || steam_bin="/usr/bin/steam"
+
+created=0
+updated=0
+skipped=0
+
+find_artwork() {
+    local app_id="$1"
+    local art_dir="$app_cache/$app_id"
+    local candidate
+
+    for candidate in \
+        library_hero_schinese.jpg \
+        library_hero.jpg \
+        library_600x900_schinese.jpg \
+        library_600x900.jpg \
+        header_schinese.jpg \
+        header.jpg
+    do
+        if [[ -f "$art_dir/$candidate" ]]; then
+            printf '%s\n' "$art_dir/$candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+is_steam_tool() {
+    local app_name="${1,,}"
+
+    case "$app_name" in
+        "steam linux runtime"*|"proton "*|"steamworks common redistributables"*|\
+        "steamworks sdk"*|"steam voice"*)
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+normalize_identity() {
+    local value="${1,,}"
+    printf '%s' "$value" | sed 's/[^[:alnum:]]//g'
+}
+
+manifest_files=()
+while IFS= read -r manifest; do
+    manifest_files+=("$manifest")
+done < <(
+    for root in "${library_roots[@]}"; do
+        realpath -m -- "$root"
+    done | sort -u | while IFS= read -r root; do
+        find "$root/steamapps" -maxdepth 1 -type f -name 'appmanifest_*.acf' -print 2>/dev/null
+    done | sort
+)
+
+detect_window_classes() {
+    command -v niri >/dev/null 2>&1 || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+
+    local title window_app_id title_key app_name app_name_key score
+    local best_app_id best_name best_score ambiguous manifest
+
+    while IFS=$'\t' read -r title window_app_id; do
+        [[ -n "$title" && -n "$window_app_id" ]] || continue
+        [[ "$window_app_id" =~ ^steam_app_[0-9]+$ ]] && continue
+
+        title_key="$(normalize_identity "$title")"
+        (( ${#title_key} >= 4 )) || continue
+
+        best_app_id=""
+        best_name=""
+        best_score=0
+        ambiguous=false
+
+        for manifest in "${manifest_files[@]}"; do
+            app_id="$(sed -n 's/^[[:space:]]*"appid"[[:space:]]*"\([0-9][0-9]*\)".*/\1/p' "$manifest" | head -n 1)"
+            app_name="$(sed -n 's/^[[:space:]]*"name"[[:space:]]*"\(.*\)".*/\1/p' "$manifest" | head -n 1)"
+            [[ -n "$app_id" && -n "$app_name" ]] || continue
+            is_steam_tool "$app_name" && continue
+
+            app_name_key="$(normalize_identity "$app_name")"
+            (( ${#app_name_key} >= 4 )) || continue
+
+            score=0
+            if [[ "$title_key" == "$app_name_key" ]]; then
+                score=10000
+            elif [[ "$title_key" == "$app_name_key"* || "$app_name_key" == "$title_key"* ]]; then
+                score="${#app_name_key}"
+            else
+                continue
+            fi
+
+            if (( score > best_score )); then
+                best_app_id="$app_id"
+                best_name="$app_name"
+                best_score="$score"
+                ambiguous=false
+            elif (( score == best_score )) && [[ "$best_app_id" != "$app_id" ]]; then
+                ambiguous=true
+            fi
+        done
+
+        if [[ -n "$best_app_id" && "$ambiguous" == false ]]; then
+            auto_wmclass_overrides["$best_app_id"]="$window_app_id"
+            printf 'detected: %s (%s) -> %s\n' "$best_name" "$best_app_id" "$window_app_id"
+        elif [[ "$ambiguous" == true ]]; then
+            printf 'detection skipped: ambiguous title "%s"\n' "$title"
+        fi
+    done < <(niri msg --json windows 2>/dev/null |
+        jq -r '.[] | select(.title != "" and .app_id != "") | [.title, .app_id] | @tsv')
+}
+
+detect_window_classes
+
+if [[ "$dry_run" == false ]]; then
+    temporary_overrides="$(mktemp --tmpdir="$(dirname -- "$auto_overrides_file")" '.wmclass-auto.XXXXXX')"
+    {
+        printf '# Automatically detected by steam-game-icon-sync\n'
+        for app_id in "${!auto_wmclass_overrides[@]}"; do
+            printf '%s\t%s\n' "$app_id" "${auto_wmclass_overrides[$app_id]}"
+        done | sort -n
+    } >"$temporary_overrides"
+    chmod 0644 "$temporary_overrides"
+    mv -f -- "$temporary_overrides" "$auto_overrides_file"
+fi
+
+write_desktop_entry() {
+    local app_id="$1"
+    local app_name="$2"
+    local icon_path="$3"
+    local wm_class="$4"
+    local desktop_path="$applications_dir/steam_app_${app_id}.desktop"
+    local temporary
+    local marker="X-Steam-Game-Icon-Sync=true"
+    local name_lines=()
+
+    if [[ -f "$desktop_path" ]] && ! grep -Fqx -- "$marker" "$desktop_path"; then
+        printf 'skip: unmanaged desktop entry exists: %s\n' "$desktop_path"
+        return 2
+    fi
+
+    if [[ -f "$desktop_path" ]]; then
+        mapfile -t name_lines < <(grep -E '^Name(\[[^]]+\])?=' "$desktop_path" || true)
+    fi
+    if (( ${#name_lines[@]} == 0 )); then
+        name_lines=("Name=$app_name")
+    fi
+
+    temporary="$(mktemp --tmpdir="$applications_dir" '.steam-desktop.XXXXXX')"
+
+    {
+        printf '[Desktop Entry]\n'
+        printf 'Type=Application\n'
+        printf '%s\n' "${name_lines[@]}"
+        printf 'Comment=发布于 Steam 的游戏\n'
+        printf 'Exec=%s steam://rungameid/%s\n' "$steam_bin" "$app_id"
+        printf 'Icon=%s\n' "$icon_path"
+        printf 'Terminal=false\n'
+        printf 'Categories=Game;\n'
+        printf 'StartupNotify=true\n'
+        printf 'StartupWMClass=%s\n' "$wm_class"
+        printf '%s\n' "$marker"
+        printf 'X-Steam-App-ID=%s\n' "$app_id"
+        printf 'X-Steam-WM-Class=%s\n' "$wm_class"
+    } >"$temporary"
+
+    if [[ "$dry_run" == false ]]; then
+        chmod 0644 "$temporary"
+        mv -f -- "$temporary" "$desktop_path"
+    else
+        rm -f -- "$temporary"
+    fi
+
+    printf 'desktop: %s\n' "$desktop_path"
+    return 0
+}
+
+for manifest in "${manifest_files[@]}"; do
+    app_id="$(sed -n 's/^[[:space:]]*"appid"[[:space:]]*"\([0-9][0-9]*\)".*/\1/p' "$manifest" | head -n 1)"
+    app_name="$(sed -n 's/^[[:space:]]*"name"[[:space:]]*"\(.*\)".*/\1/p' "$manifest" | head -n 1)"
+
+    [[ -n "$app_id" && -n "$app_name" ]] || continue
+    [[ -z "${seen_apps[$app_id]:-}" ]] || continue
+    seen_apps["$app_id"]=1
+
+    if is_steam_tool "$app_name"; then
+        printf 'skip: Steam tool for %s (%s)\n' "$app_name" "$app_id"
+        (( skipped += 1 ))
+        continue
+    fi
+
+    source_path="$sources_dir/steam_app_${app_id}.png"
+    artwork="$source_path"
+    if [[ ! -f "$source_path" ]]; then
+        artwork="$(find_artwork "$app_id" 2>/dev/null || true)"
+        if [[ -z "$artwork" ]]; then
+            printf 'skip: no cached artwork for %s (%s)\n' "$app_name" "$app_id"
+            (( skipped += 1 ))
+            continue
+        fi
+    fi
+
+    icon_path="$icons_dir/steam_app_${app_id}.png"
+    printf 'found: %s (%s)\n' "$app_name" "$app_id"
+
+    if [[ "$dry_run" == false ]]; then
+        if [[ ! -f "$source_path" ]]; then
+            width="$(magick identify -format '%w' "$artwork")"
+            height="$(magick identify -format '%h' "$artwork")"
+            square=$(( width < height ? width : height ))
+            x_offset=$(( (width - square) / 2 ))
+            y_offset=$(( (height - square) / 2 ))
+            temporary_source="$(mktemp --tmpdir="$sources_dir" '.steam-source.XXXXXX.png')"
+            trap 'rm -f -- "$temporary_source"' EXIT
+
+            magick "$artwork" \
+                -crop "${square}x${square}+${x_offset}+${y_offset}" \
+                +repage \
+                -resize 256x256 \
+                -strip \
+                "PNG32:$temporary_source"
+            chmod 0644 "$temporary_source"
+            mv -f -- "$temporary_source" "$source_path"
+            trap - EXIT
+            artwork="$source_path"
+        fi
+
+        temporary_icon="$(mktemp --tmpdir="$icons_dir" '.steam-icon.XXXXXX.png')"
+        trap 'rm -f -- "$temporary_icon"' EXIT
+
+        magick "$artwork" -strip "PNG32:$temporary_icon"
+        "$rounding_tool" --radius "$radius" "$temporary_icon" >/dev/null
+        chmod 0644 "$temporary_icon"
+        mv -f -- "$temporary_icon" "$icon_path"
+        trap - EXIT
+    fi
+
+    desktop_path="$applications_dir/steam_app_${app_id}.desktop"
+    entry_existed=false
+    [[ -f "$desktop_path" ]] && entry_existed=true
+    wm_class="${manual_wmclass_overrides[$app_id]:-${auto_wmclass_overrides[$app_id]:-steam_app_$app_id}}"
+
+    if write_desktop_entry "$app_id" "$app_name" "$icon_path" "$wm_class"; then
+        if [[ "$entry_existed" == true ]]; then
+            (( updated += 1 ))
+        else
+            (( created += 1 ))
+        fi
+    else
+        (( skipped += 1 ))
+    fi
+done
+
+if [[ "$dry_run" == false ]]; then
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "$applications_dir" >/dev/null 2>&1 || true
+    fi
+    if command -v noctalia >/dev/null 2>&1; then
+        noctalia msg config-reload >/dev/null 2>&1 || true
+        noctalia msg dock-reload >/dev/null 2>&1 || true
+    fi
+fi
+
+printf 'summary: %d created, %d updated, %d skipped, radius=%d%s\n' \
+    "$created" "$updated" "$skipped" "$radius" \
+    "$([[ "$dry_run" == true ]] && printf ' (dry run)' || true)"
