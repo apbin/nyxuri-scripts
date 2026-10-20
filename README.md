@@ -6,10 +6,7 @@
 
 `steam-game-icon-sync` 会扫描 Steam 游戏库，根据 Steam 缓存的艺术图生成统一的圆角图标和桌面条目，使 Niri Dock 中的 Steam 游戏拥有正确的名称、图标和窗口标识。
 
-仓库包含两个脚本：
-
-- `steam-game-icon-sync`：扫描游戏库并生成图标与桌面条目。
-- `steam-game-icon-round`：为主脚本提供圆角处理能力，也可以单独使用。
+整个仓库只包含一个可执行脚本 `steam-game-icon-sync`，同时提供游戏图标同步和独立圆角处理两种模式。
 
 ### 依赖
 
@@ -36,7 +33,7 @@ sudo pacman -S imagemagick jq
 在仓库目录直接运行：
 
 ```bash
-chmod +x steam-game-icon-sync steam-game-icon-round
+chmod +x steam-game-icon-sync
 ./steam-game-icon-sync --dry-run
 ```
 
@@ -46,11 +43,10 @@ chmod +x steam-game-icon-sync steam-game-icon-round
 ./steam-game-icon-sync
 ```
 
-也可以把两个脚本安装到 `~/.local/bin`，之后在任何目录直接调用：
+也可以把脚本安装到 `~/.local/bin`，之后在任何目录直接调用：
 
 ```bash
 install -Dm755 steam-game-icon-sync ~/.local/bin/steam-game-icon-sync
-install -Dm755 steam-game-icon-round ~/.local/bin/steam-game-icon-round
 steam-game-icon-sync --dry-run
 ```
 
@@ -98,10 +94,10 @@ Linux 原生游戏如果同步后仍显示默认图标，按以下步骤处理�
 steam-game-icon-sync --radius 40
 ```
 
-也可以只处理一个或多个独立图标：
+使用 `--round` 模式，只处理一个或多个独立图标：
 
 ```bash
-steam-game-icon-round --radius 40 图标.png
+steam-game-icon-sync --round --radius 40 图标.png
 ```
 
 ### 生成文件位置

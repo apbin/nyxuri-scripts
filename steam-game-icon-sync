@@ -6,10 +6,14 @@ usage() {
     cat <<'EOF'
 Usage:
   steam-game-icon-sync [--dry-run] [--radius N]
+  steam-game-icon-sync --round [--radius N] IMAGE [IMAGE...]
 
 Scans installed Steam appmanifests that have cached Steam artwork, creates one
 256x256 rounded icon per application, writes matching .desktop entries, updates
 the desktop database, and asks Noctalia to refresh its dock.
+
+With --round, only adds transparent rounded corners to the supplied square PNG
+images. Steam data and desktop integration are not touched in this mode.
 
 Games normally use StartupWMClass=steam_app_<AppID>. Native ports whose window
 class differs are detected automatically from running niri windows. Manual
@@ -26,6 +30,8 @@ EOF
 }
 
 dry_run=false
+round_mode=false
+round_images=()
 radius="${STEAM_ICON_CORNER_RADIUS:-56}"
 
 while (( $# > 0 )); do
@@ -33,6 +39,10 @@ while (( $# > 0 )); do
         -h|--help)
             usage
             exit 0
+            ;;
+        --round)
+            round_mode=true
+            shift
             ;;
         --dry-run)
             dry_run=true
@@ -47,9 +57,14 @@ while (( $# > 0 )); do
             shift 2
             ;;
         *)
-            printf 'error: unknown argument: %s\n' "$1" >&2
-            usage >&2
-            exit 2
+            if [[ "$round_mode" == true ]]; then
+                round_images+=("$1")
+                shift
+            else
+                printf 'error: unknown argument: %s\n' "$1" >&2
+                usage >&2
+                exit 2
+            fi
             ;;
     esac
 done
@@ -59,31 +74,93 @@ done
     exit 2
 }
 
+command -v magick >/dev/null 2>&1 || {
+    printf 'error: ImageMagick (magick) is required\n' >&2
+    exit 1
+}
+
+round_image() {
+    local verbose="$1"
+    shift
+
+    local source width height max_radius effective_radius
+    local output_dir temporary
+
+    for source in "$@"; do
+        [[ -f "$source" ]] || {
+            printf 'error: not a regular file: %s\n' "$source" >&2
+            return 1
+        }
+
+        width="$(magick identify -format '%w' "$source")"
+        height="$(magick identify -format '%h' "$source")"
+        [[ "$width" == "$height" ]] || {
+            printf 'error: icon must be square: %s (%sx%s)\n' "$source" "$width" "$height" >&2
+            return 1
+        }
+
+        max_radius=$(( width / 2 ))
+        effective_radius="$radius"
+        (( effective_radius <= max_radius )) || effective_radius="$max_radius"
+
+        output_dir="$(dirname -- "$source")"
+        temporary="$(mktemp --tmpdir="$output_dir" '.steam-icon-round.XXXXXX.png')"
+
+        if ! magick "$source" \
+            -alpha set \
+            \( -size "${width}x${height}" xc:none \
+               -fill white \
+               -draw "roundrectangle 0,0,$((width - 1)),$((height - 1)),${effective_radius},${effective_radius}" \) \
+            -compose DstIn \
+            -composite \
+            -strip \
+            PNG32:"$temporary"
+        then
+            rm -f -- "$temporary"
+            return 1
+        fi
+
+        if ! chmod --reference="$source" "$temporary" ||
+            ! mv -f -- "$temporary" "$source"
+        then
+            rm -f -- "$temporary"
+            return 1
+        fi
+
+        if [[ "$verbose" == true ]]; then
+            printf 'rounded: %s (radius=%s)\n' "$source" "$effective_radius"
+        fi
+    done
+}
+
+if [[ "$round_mode" == true ]]; then
+    [[ "$dry_run" == false ]] || {
+        printf 'error: --round cannot be combined with --dry-run\n' >&2
+        exit 2
+    }
+    (( ${#round_images[@]} > 0 )) || {
+        printf 'error: --round requires at least one image\n' >&2
+        usage >&2
+        exit 2
+    }
+    round_image true "${round_images[@]}"
+    exit 0
+fi
+
 steam_root="${STEAM_ROOT:-$HOME/.local/share/Steam}"
 app_cache="$steam_root/appcache/librarycache"
 applications_dir="$HOME/.local/share/applications"
 icons_dir="$HOME/.local/share/icons/hicolor/256x256/apps"
 sources_dir="$HOME/.local/share/steam-game-icons/sources"
-script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-rounding_tool="$script_dir/steam-game-icon-round"
-if [[ ! -e "$rounding_tool" ]]; then
-    rounding_tool="$(command -v steam-game-icon-round 2>/dev/null || true)"
-fi
-[[ -n "$rounding_tool" ]] || rounding_tool="$HOME/.local/bin/steam-game-icon-round"
 manual_overrides_file="${STEAM_GAME_ICON_WMCLASS_OVERRIDES:-$HOME/.config/steam-game-icon-sync/wmclass-overrides.tsv}"
 auto_overrides_file="$HOME/.local/share/steam-game-icons/wmclass-auto.tsv"
 
-for required in "$steam_root/steamapps" "$app_cache" "$rounding_tool"; do
+for required in "$steam_root/steamapps" "$app_cache"; do
     [[ -e "$required" ]] || {
         printf 'error: required path missing: %s\n' "$required" >&2
         exit 1
     }
 done
-
-command -v magick >/dev/null 2>&1 || {
-    printf 'error: ImageMagick (magick) is required\n' >&2
-    exit 1
-}
 
 mkdir -p "$applications_dir" "$icons_dir" "$sources_dir"
 
@@ -349,7 +426,7 @@ for manifest in "${manifest_files[@]}"; do
         trap 'rm -f -- "$temporary_icon"' EXIT
 
         magick "$artwork" -strip "PNG32:$temporary_icon"
-        "$rounding_tool" --radius "$radius" "$temporary_icon" >/dev/null
+        round_image false "$temporary_icon"
         chmod 0644 "$temporary_icon"
         mv -f -- "$temporary_icon" "$icon_path"
         trap - EXIT
